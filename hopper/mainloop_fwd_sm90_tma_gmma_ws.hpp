@@ -1,3 +1,4 @@
+#include "gwatch/cuda/trace.hpp"
 /******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
@@ -9,6 +10,8 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 #include "cutlass/pipeline/pipeline.hpp"
+
+#include "gwatch/cuda/trace.hpp"
 
 #include "cute/tensor.hpp"
 
@@ -747,7 +750,10 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(2);
             pipeline_k.producer_acquire(smem_pipe_write);
+            GWATCH_CUDA_KERNEL_SCOPE_END(2);
+            GWATCH_CUDA_KERNEL_SCOPE_START(12);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
                 copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
@@ -757,11 +763,15 @@ struct CollectiveMainloopFwdSm90 {
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
                 pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
+            GWATCH_CUDA_KERNEL_SCOPE_END(12);
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
             auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
+            GWATCH_CUDA_KERNEL_SCOPE_START(3);
             pipeline_v_load.producer_acquire(smem_pipe_write);
+            GWATCH_CUDA_KERNEL_SCOPE_END(3);
+            GWATCH_CUDA_KERNEL_SCOPE_START(13);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
                 copy(params.tma_load_V.with(*pipeline_v_load.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
@@ -771,6 +781,7 @@ struct CollectiveMainloopFwdSm90 {
                 paged_kv_manager.template load_V<Seqlenk_mask>(n_block, sVcpasync(_, _, smem_pipe_write.index()));
                 pipeline_v_load.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
+            GWATCH_CUDA_KERNEL_SCOPE_END(13);
         };
 
         auto copy_Vt_to_V = [&] (auto const& smem_pipe_write) {
@@ -778,8 +789,12 @@ struct CollectiveMainloopFwdSm90 {
             // and exploit the invariance that smem_pipe_write.phase() == smem_pipe_read.phase() ^ 1.
             // This saves 1 or 2 registers.
             PipelineState smem_pipe_read{smem_pipe_write.index(), smem_pipe_write.phase() ^ 1, smem_pipe_write.count()};
+            GWATCH_CUDA_KERNEL_SCOPE_START(33);
             pipeline_vt.consumer_wait(smem_pipe_read);
+            GWATCH_CUDA_KERNEL_SCOPE_END(33);
+            GWATCH_CUDA_KERNEL_SCOPE_START(3);
             pipeline_v.producer_acquire(smem_pipe_write);
+            GWATCH_CUDA_KERNEL_SCOPE_END(3);
             transpose_V(smem_pipe_write.index());
             // SMEM fence to make sure V is transposed before math
             cutlass::arch::fence_view_async_shared();
@@ -803,18 +818,25 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if constexpr (Transpose_V) { 
+                GWATCH_CUDA_KERNEL_SCOPE_START(13);
+                load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+                GWATCH_CUDA_KERNEL_SCOPE_END(13); 
+            }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
+            GWATCH_CUDA_KERNEL_SCOPE_START(12);
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+            GWATCH_CUDA_KERNEL_SCOPE_END(12);
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
         }
 
         if constexpr (Use_TMA_Q) {
             // Wait for the MMA warpgroups to signal that smem_q is ready
+            GWATCH_CUDA_KERNEL_SCOPE_START(1);
             if (SingleProducerWarp || warp_idx_in_warpgroup == 0) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             }
-
+            GWATCH_CUDA_KERNEL_SCOPE_END(1);
             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
                 shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
                 copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
@@ -825,6 +847,7 @@ struct CollectiveMainloopFwdSm90 {
                         tQvgQv, tQvsQv);
                 }
             }
+            GWATCH_CUDA_KERNEL_SCOPE_START(11); // start loading
         } else {  // Load Q with cp.async
             cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
@@ -867,13 +890,23 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                if constexpr (Transpose_V) { 
+                    GWATCH_CUDA_KERNEL_SCOPE_START(13);
+                    load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); 
+                    GWATCH_CUDA_KERNEL_SCOPE_END(13);
+                }
+                GWATCH_CUDA_KERNEL_SCOPE_START(12);
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                GWATCH_CUDA_KERNEL_SCOPE_END(12);
                 if constexpr (!Transpose_V) {
                     if constexpr (IntraWGOverlap) {
+                        GWATCH_CUDA_KERNEL_SCOPE_START(13);
                         load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
+                        GWATCH_CUDA_KERNEL_SCOPE_END(13);
                     } else {
+                        GWATCH_CUDA_KERNEL_SCOPE_START(13);
                         load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                        GWATCH_CUDA_KERNEL_SCOPE_END(13);
                     }
                 }
             }
@@ -1078,7 +1111,7 @@ struct CollectiveMainloopFwdSm90 {
 
         auto write_P_to_smem = [&](auto& tOrP) {
             if constexpr (LargeHeadDimV) {
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             }
             cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
         };
@@ -1093,7 +1126,10 @@ struct CollectiveMainloopFwdSm90 {
 
         auto &barrier_Q = shared_storage.pipelines.barrier_Q;
         if constexpr (!AppendKV) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(31);
             barrier_Q.wait(work_idx % 2);
+            GWATCH_CUDA_KERNEL_SCOPE_END(1);
+            GWATCH_CUDA_KERNEL_SCOPE_END(31);
         } else {
             if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
                 using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
@@ -1108,21 +1144,31 @@ struct CollectiveMainloopFwdSm90 {
                         rotary.template load_cos_sin<true /*kInterleaved*/>(m_block),
                         rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
                     );
+                    GWATCH_CUDA_KERNEL_SCOPE_START(31);
                     barrier_Q.wait(work_idx % 2);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(1);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(31);
                     rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block, qhead_per_khead);
                 } else {
                     auto [tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(
                         rotary.template load_cos_sin<false /*kInterleaved*/>(m_block),
                         rotary.template load_cos_sin_packgqa<false /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
                     );
+                    GWATCH_CUDA_KERNEL_SCOPE_START(31);
                     barrier_Q.wait(work_idx % 2);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(1);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(31);
                     rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block, qhead_per_khead);
                 }
+
                 // SMEM fence to make sure the rotated Q is visible to GMMA
                 cutlass::arch::fence_view_async_shared();
                 cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
             } else {
+                GWATCH_CUDA_KERNEL_SCOPE_START(31);
                 barrier_Q.wait(work_idx % 2);
+                GWATCH_CUDA_KERNEL_SCOPE_END(1);
+                GWATCH_CUDA_KERNEL_SCOPE_END(31);
             }
         }
 
@@ -1137,22 +1183,32 @@ struct CollectiveMainloopFwdSm90 {
 
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+            GWATCH_CUDA_KERNEL_SCOPE_START(32);
             consumer_wait(pipeline_k, smem_pipe_read);
+            GWATCH_CUDA_KERNEL_SCOPE_END(32);
+            GWATCH_CUDA_KERNEL_SCOPE_START(21);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+
             warpgroup_wait<0>();
+            GWATCH_CUDA_KERNEL_SCOPE_END(21);
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
+                GWATCH_CUDA_KERNEL_SCOPE_START(33);
                 consumer_wait(pipeline_v, smem_pipe_read);
+                GWATCH_CUDA_KERNEL_SCOPE_END(33);
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
+
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            GWATCH_CUDA_KERNEL_SCOPE_START(23);
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
-
             softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+            GWATCH_CUDA_KERNEL_SCOPE_END(23);
+
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
@@ -1172,37 +1228,66 @@ struct CollectiveMainloopFwdSm90 {
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
-                if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
-                warp_scheduler_barrier_sync();
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-                if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
-                if constexpr(!HasQv) {
-                    if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
+                if (!UseSchedulerBarrier || warp_group_idx == 0) {
+                    GWATCH_CUDA_KERNEL_SCOPE_START(32);
+                    consumer_wait(pipeline_k, smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(32);
                 }
+                warp_scheduler_barrier_sync();
+                GWATCH_CUDA_KERNEL_SCOPE_START(21);
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                if constexpr (RescaleOBeforeGemm) {
+                    
+                    softmax.rescale_o(tOrO, scores_scale);
+                }
+                if constexpr(!HasQv) {
+                    if (!UseSchedulerBarrier || warp_group_idx == 0) {
+                        GWATCH_CUDA_KERNEL_SCOPE_START(33);
+                        consumer_wait(pipeline_v, smem_pipe_read_v);
+                        GWATCH_CUDA_KERNEL_SCOPE_END(33);
+                    }
+                }
+                GWATCH_CUDA_KERNEL_SCOPE_START(22);
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
+                GWATCH_CUDA_KERNEL_SCOPE_END(21);
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
                 if constexpr (HasQv) {
                     warpgroup_wait<0>();
+                    GWATCH_CUDA_KERNEL_SCOPE_END(22);
+
+
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+                    GWATCH_CUDA_KERNEL_SCOPE_START(33);
                     consumer_wait(pipeline_v, smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(33);
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
+                GWATCH_CUDA_KERNEL_SCOPE_START(23);
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
                 softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+                GWATCH_CUDA_KERNEL_SCOPE_END(23);
                 if constexpr (!HasQv) {
                     warpgroup_wait<0>();
+                    GWATCH_CUDA_KERNEL_SCOPE_END(22);
+
+
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                 }
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-                if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr (!RescaleOBeforeGemm) {
+                    GWATCH_CUDA_KERNEL_SCOPE_START(23);
+                    softmax.rescale_o(tOrO, scores_scale);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(23);
+                }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
@@ -1236,16 +1321,23 @@ struct CollectiveMainloopFwdSm90 {
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
-            if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+            if constexpr (!HasQv) {
+                GWATCH_CUDA_KERNEL_SCOPE_START(33);
+                consumer_wait(pipeline_v, smem_pipe_read);
+                GWATCH_CUDA_KERNEL_SCOPE_END(33);
+            }
+            GWATCH_CUDA_KERNEL_SCOPE_START(22);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             cute::copy(softmax.finalize(v_descale), scores_scale);
             if constexpr (LargeHeadDimV) {
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
             warpgroup_wait<0>();
+            GWATCH_CUDA_KERNEL_SCOPE_END(22);
+
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
@@ -1261,46 +1353,68 @@ struct CollectiveMainloopFwdSm90 {
                 auto smem_pipe_read_prev = smem_pipe_read;
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+                GWATCH_CUDA_KERNEL_SCOPE_START(32);
                 consumer_wait(pipeline_k, smem_pipe_read);
+                GWATCH_CUDA_KERNEL_SCOPE_END(32);
+                GWATCH_CUDA_KERNEL_SCOPE_START(21);
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
+                    GWATCH_CUDA_KERNEL_SCOPE_END(21);
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                 } else {
                     if constexpr (Is_first_iter) {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
+                    GWATCH_CUDA_KERNEL_SCOPE_START(33);
                     consumer_wait(pipeline_v, smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(33);
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<1>();
+                    GWATCH_CUDA_KERNEL_SCOPE_END(21);
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                     warpgroup_wait<0>();
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
+                GWATCH_CUDA_KERNEL_SCOPE_START(23);
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
                 softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+                GWATCH_CUDA_KERNEL_SCOPE_END(23);
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
                 convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-                if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr (!Is_first_iter) {
+                    GWATCH_CUDA_KERNEL_SCOPE_START(23);
+                    softmax.rescale_o(tOrO, scores_scale);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(23);
+                }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
-                if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+                if constexpr (!HasQv) {
+                    GWATCH_CUDA_KERNEL_SCOPE_START(33);
+                    consumer_wait(pipeline_v, smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(33);
+                }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
+                    GWATCH_CUDA_KERNEL_SCOPE_START(22);
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
+                    GWATCH_CUDA_KERNEL_SCOPE_START(22);
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
+                GWATCH_CUDA_KERNEL_SCOPE_END(22);
+
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
 
@@ -1339,11 +1453,13 @@ struct CollectiveMainloopFwdSm90 {
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             Tensor scores_scale = softmax.finalize(v_descale);
             if constexpr (LargeHeadDimV) {
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+            cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             }
+            GWATCH_CUDA_KERNEL_SCOPE_START(23);
             softmax.rescale_o(tOrO, scores_scale);
+            GWATCH_CUDA_KERNEL_SCOPE_END(23);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
@@ -1412,9 +1528,15 @@ struct CollectiveMainloopFwdSm90 {
 
         int n_block = n_block_max - 1;
         // If HasQv, then by the time P is ready, V must have been ready as well
-        if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
+        if constexpr (!HasQv) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(33);
+            pipeline_v.consumer_wait(smem_pipe_read);
+            GWATCH_CUDA_KERNEL_SCOPE_END(33);
+        }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+        GWATCH_CUDA_KERNEL_SCOPE_START(22);
         flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        GWATCH_CUDA_KERNEL_SCOPE_END(22);
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
@@ -1423,20 +1545,28 @@ struct CollectiveMainloopFwdSm90 {
         for (; n_block >= n_block_min; --n_block) {
             cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
             load_scales(scores_scale, smem_pipe_read.index());
+            GWATCH_CUDA_KERNEL_SCOPE_START(23);
             softmax.rescale_o(tOrO, scores_scale);
+            GWATCH_CUDA_KERNEL_SCOPE_END(23);
             ++smem_pipe_read;
             if constexpr (!HasQv) {
+                GWATCH_CUDA_KERNEL_SCOPE_START(33);
                 auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
                 pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
+                GWATCH_CUDA_KERNEL_SCOPE_END(33);
             }
+            GWATCH_CUDA_KERNEL_SCOPE_START(22);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            GWATCH_CUDA_KERNEL_SCOPE_END(22);
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             pipeline_v.consumer_release(smem_pipe_read);  // release V
         };
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
         load_scales(scores_scale, smem_pipe_read.index());
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
+        GWATCH_CUDA_KERNEL_SCOPE_START(23);
         softmax.rescale_o(tOrO, scores_scale);
+        GWATCH_CUDA_KERNEL_SCOPE_END(23);
         if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
         ++smem_pipe_read;
         return true;
@@ -1503,13 +1633,17 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K_new = [&] (int const n_block, auto const& smem_pipe_write) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(2);
             pipeline_k_new.producer_acquire(smem_pipe_write);
+            GWATCH_CUDA_KERNEL_SCOPE_END(2);
             copy(params.tma_load_K_new.with(*pipeline_k_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_FIRST),
                 tKgKnew_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
         };
 
         auto load_V_new = [&] (int const n_block, auto const& smem_pipe_write) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(3);
             pipeline_v_new.producer_acquire(smem_pipe_write);
+            GWATCH_CUDA_KERNEL_SCOPE_END(3);
             copy(params.tma_load_V_new.with(*pipeline_v_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_FIRST),
                 tVgVnewt_TMA(_, n_block), tVsVt_TMA(_, smem_pipe_write.index()));
         };
@@ -1640,7 +1774,9 @@ struct CollectiveMainloopFwdSm90 {
         auto store_K = [&] (int const n_block, auto const& smem_pipe_read) {
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             if (get<1>(params.shape_rotary) <= 0) {
+                GWATCH_CUDA_KERNEL_SCOPE_START(32);
                 pipeline_k_new.consumer_wait(smem_pipe_read);
+                GWATCH_CUDA_KERNEL_SCOPE_END(32);
                 Tensor tKsK_cur = tKsK(_, _, _, smem_pipe_read.index());
                 if constexpr (!PagedKVNonTMA) {
                     Tensor tKgK_cur = tKgK(_, _, _, n_block);
@@ -1656,11 +1792,15 @@ struct CollectiveMainloopFwdSm90 {
                 auto tPrKPtr = cute::conditional_return<PagedKVNonTMA>(paged_kv_manager.compute_K_ptr(), nullptr);
                 if (params.is_rotary_interleaved) {
                     auto [tRrCos, tRrSin] = rotary.template load_cos_sin<true /*kInterleaved*/>(n_block);
+                    GWATCH_CUDA_KERNEL_SCOPE_START(32);
                     pipeline_k_new.consumer_wait(smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(32);
                     rotary.template apply_K_interleaved<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCos, tRrSin, tPrKPtr, n_block);
                 } else {
                     auto [tRrCosCont, tRrSinCont] = rotary.template load_cos_sin<false /*kInterleaved*/>(n_block);
+                    GWATCH_CUDA_KERNEL_SCOPE_START(32);
                     pipeline_k_new.consumer_wait(smem_pipe_read);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(32);
                     rotary.template apply_K_contiguous<PagedKVNonTMA>(sK(_, _, smem_pipe_read.index()), gK_cur, tKpK, tRrCosCont, tRrSinCont, tPrKPtr, n_block, get<1>(params.shape_K));
                 }
             }
@@ -1674,7 +1814,9 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         auto store_V = [&] (int const n_block, auto const& smem_pipe_read) {
+            GWATCH_CUDA_KERNEL_SCOPE_START(33);
             pipeline_v_new.consumer_wait(smem_pipe_read);
+            GWATCH_CUDA_KERNEL_SCOPE_END(33);
             int const n_limit = std::min(seqlen_k_new - n_block * kBlockN, kBlockN);
             Tensor tVsV_cur = tVsV(_, _, _, smem_pipe_read.index());
             if constexpr (!PagedKVNonTMA) {

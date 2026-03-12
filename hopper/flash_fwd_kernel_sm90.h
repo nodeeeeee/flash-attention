@@ -1,3 +1,4 @@
+#include "gwatch/cuda/trace.hpp"
 /******************************************************************************
  * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
@@ -13,6 +14,8 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/pipeline/pipeline.hpp"
+
+#include "gwatch/cuda/trace.hpp"
 
 #include "cutlass/arch/grid_dependency_control.h"
 
@@ -441,14 +444,21 @@ public:
                 }
                 if (tile_valid) {
                     // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
+                    GWATCH_CUDA_KERNEL_SCOPE_START(41);
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(41);
                 } else {
                     // Write 0 to gO and -inf to gLSE.
+                    GWATCH_CUDA_KERNEL_SCOPE_START(41);
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+                    GWATCH_CUDA_KERNEL_SCOPE_END(41);
                 }
             }
+            GWATCH_CUDA_KERNEL_SCOPE_START(41);
             epilogue.store_tail();
+            GWATCH_CUDA_KERNEL_SCOPE_END(41);
+
         }
 
     }
